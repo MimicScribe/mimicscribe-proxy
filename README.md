@@ -1,19 +1,13 @@
 # MimicScribe Gemini API Proxy
 
-This is the Cloudflare Worker that sits between the [MimicScribe](https://mimicscribe.app) desktop app and Google's Gemini API. We publish this code so you can verify exactly what happens to your data in transit.
+This is the Cloudflare Worker that sits between the [MimicScribe](https://mimicscribe.app) desktop app and Google's Gemini API. The code is published here so you can see exactly what happens to your data in transit.
 
 ## What this proxy does
 
 1. **Authenticates** the request (trial device ID hash or license key)
 2. **Strips all identity headers** (`X-Device-Id`, `X-License-Key`, `X-Feature`, `X-Meeting-Id`, `X-Local-Date`) before forwarding to Google
-3. **Forwards the request body directly** to `generativelanguage.googleapis.com` — the request body is never read, buffered, or logged by this Worker
+3. **Forwards the request body directly** to `generativelanguage.googleapis.com` without reading, buffering, or logging it
 4. **Returns the response** to the client, passing through only `content-type` and `content-length` headers
-
-## What this proxy does NOT do
-
-- Log, store, or inspect request bodies (transcript text, images, prompts)
-- Send request content to any service other than Google's Gemini API
-- Associate transcript content with device identifiers or license keys
 
 ## What gets logged
 
