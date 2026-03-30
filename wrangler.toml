@@ -1,0 +1,17 @@
+name = "mimicscribe-proxy"
+main = "src/proxy.ts"
+compatibility_date = "2024-12-01"
+
+# Secrets (set via `wrangler secret put`):
+#   GEMINI_API_KEY — Google Gemini API key
+
+[vars]
+# No plaintext secrets here
+
+[[kv_namespaces]]
+binding = "TRIAL_USAGE"
+id = "your-kv-namespace-id"
+
+[[durable_objects.bindings]]
+name = "TRIAL_COUNTER"
+class_name = "TrialCounter"

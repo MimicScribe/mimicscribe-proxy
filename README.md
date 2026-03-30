@@ -1,0 +1,77 @@
+# MimicScribe Gemini API Proxy
+
+This is the Cloudflare Worker that sits between the [MimicScribe](https://mimicscribe.app) desktop app and Google's Gemini API. We publish this code so you can verify exactly what happens to your data in transit.
+
+## What this proxy does
+
+1. **Authenticates** the request (trial device ID hash or license key)
+2. **Strips all identity headers** (`X-Device-Id`, `X-License-Key`, `X-Feature`, `X-Meeting-Id`, `X-Local-Date`) before forwarding to Google
+3. **Forwards the request body directly** to `generativelanguage.googleapis.com` — the request body is never read, buffered, or logged by this Worker
+4. **Returns the response** to the client, passing through only `content-type` and `content-length` headers
+
+## What this proxy does NOT do
+
+- Log, store, or inspect request bodies (transcript text, images, prompts)
+- Send request content to any service other than Google's Gemini API
+- Associate transcript content with device identifiers or license keys
+
+## What gets logged
+
+The only `console.log` output is a structured metadata line per request:
+
+```
+[gemini] OK model=gemini-2.0-flash-001 feature=fusion auth=trial id=a1b2c3d4 authMs=12 geminiMs=834 totalMs=846 status=200
+```
+
+No request body, response body, or transcript content appears in logs.
+
+## Data flow
+
+```
+MimicScribe App
+    |
+    |  POST /api/gemini/v1beta/models/gemini-2.0-flash:generateContent
+    |  Headers: X-Device-Id, X-Feature, Content-Type
+    |  Body: { transcript text, prompt }
+    |
+    v
++------------------------------------------+
+|  This Cloudflare Worker                  |
+|                                          |
+|  1. Parse auth from headers              |
+|  2. Rate limit (30 req/min)              |
+|  3. Check trial/license caps via DO/KV   |
+|  4. DELETE identity headers              |
+|  5. Forward request body to Google       |
+|  6. Return response to client            |
+|                                          |
+|  Request body is never read or logged.   |
++------------------------------------------+
+    |
+    |  POST https://generativelanguage.googleapis.com/...
+    |  Headers: Content-Type (identity headers removed)
+    |  Body: unchanged from client
+    |
+    v
+Google Gemini API
+```
+
+## Trial token counting
+
+For free-tier users, the proxy tees the Gemini response stream and scans it chunk-by-chunk for the `usageMetadata` field. Each chunk is discarded immediately after scanning — the full response is never buffered in memory. When `usageMetadata` is found, only the integer token count (`promptTokenCount` + `candidatesTokenCount`) is extracted and recorded to a Durable Object for lifetime budget tracking.
+
+Licensed users are not affected — their responses are streamed directly to the client with no tee or scanning.
+
+## Durable Object state
+
+For trial users, the `checkAndIncrement` call to the Durable Object includes the `deviceId` and `meetingId` (if present). The DO uses these to enforce per-meeting caps (e.g., one summary per meeting per device). These identifiers are stored in the DO's transient state for cap tracking only — they are not logged or sent to any external service. The DO does not receive or store any transcript content.
+
+## Production differences
+
+This repository contains the Gemini proxy logic extracted from our production SvelteKit deployment. The production version is integrated into our website's Cloudflare Workers setup. The core proxy behavior — header stripping, request body forwarding, response handling, and logging — is identical to what you see here.
+
+The production Worker also serves separate endpoints for usage reporting (Polar), analytics, and crash diagnostics. These endpoints are not part of the Gemini proxy path and are not included in this repository.
+
+## License
+
+MIT

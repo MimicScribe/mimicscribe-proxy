@@ -1,0 +1,15 @@
+{
+	"name": "mimicscribe-proxy",
+	"version": "1.0.0",
+	"private": true,
+	"description": "MimicScribe's Gemini API proxy — open source so you can verify we don't log your data",
+	"license": "MIT",
+	"scripts": {
+		"dev": "wrangler dev",
+		"deploy": "wrangler deploy"
+	},
+	"devDependencies": {
+		"@cloudflare/workers-types": "^4.20241218.0",
+		"wrangler": "^3.99.0"
+	}
+}
