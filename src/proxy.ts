@@ -55,6 +55,13 @@ export function parseAuth(request: Request): AuthContext | null {
 }
 
 // ---------------------------------------------------------------------------
+// Token count regexes — module-level to avoid recompilation per request.
+// ---------------------------------------------------------------------------
+
+const PROMPT_TOKEN_RE = /"promptTokenCount"\s*:\s*(\d+)/;
+const CANDIDATES_TOKEN_RE = /"candidatesTokenCount"\s*:\s*(\d+)/;
+
+// ---------------------------------------------------------------------------
 // Rate limiting (in-memory, per-isolate)
 // ---------------------------------------------------------------------------
 
@@ -166,7 +173,7 @@ export async function handleGeminiProxy(
 		console.log(
 			`[gemini] RATE_LIMITED model=${model} auth=${auth.type} id=${auth.shortId}`,
 		);
-		return new Response('Rate limited', { status: 429 });
+		return rateLimitedResponse();
 	}
 
 	const feature = request.headers.get('X-Feature');
@@ -206,18 +213,26 @@ export async function handleGeminiProxy(
 	);
 	const authMs = Date.now() - authStart;
 
+	// Always trigger background revalidation for licensed users — even on denial.
+	// This self-heals when the KV entry expires (prevents permanent lockout).
+	if (auth.licenseKey) {
+		ctx.waitUntil(revalidateLicenseInBackground(auth.licenseKey, env));
+	}
+
 	if (!authResult.allowed) {
 		controller.abort();
 		console.log(
 			`[gemini] AUTH_DENIED model=${model} feature=${feature} auth=${auth.type} id=${auth.shortId} authMs=${authMs} reason=${authResult.reason}`,
 		);
-		return new Response(authResult.reason ?? 'Forbidden', { status: 403 });
-	}
-
-	// Background revalidation for licensed users — refresh KV cache
-	// periodically so auth doesn't go stale between Polar checks.
-	if (auth.licenseKey) {
-		ctx.waitUntil(revalidateLicenseInBackground(auth.licenseKey, env));
+		const code = authResult.denialCode ?? denialCodeFor(authResult.reason);
+		const headers: HeadersInit = {};
+		if (code) headers['X-Denial-Reason'] = code;
+		if (authResult.lifetimeWarning)
+			headers['X-Lifetime-Warning'] = authResult.lifetimeWarning;
+		return new Response(authResult.reason ?? 'Forbidden', {
+			status: 403,
+			headers,
+		});
 	}
 
 	let geminiResponse: Response;
@@ -269,7 +284,31 @@ export async function handleGeminiProxy(
 interface AuthResult {
 	allowed: boolean;
 	reason?: string;
+	denialCode?: string;
 	lifetimeWarning?: string;
+}
+
+/** Map DO denial reasons to machine-readable codes for X-Denial-Reason header.
+ *  License denial codes are set directly on AuthResult by checkAuth(). */
+const DENIAL_CODES: Record<string, string> = {
+	'Lifetime free tier budget exhausted': 'lifetime_exhausted',
+	'Daily cap reached': 'daily_cap',
+	'Feature requires Pro': 'pro_required',
+};
+
+function denialCodeFor(reason: string | undefined): string | undefined {
+	if (!reason) return undefined;
+	return (
+		DENIAL_CODES[reason] ??
+		(reason.startsWith('Unknown feature') ? 'unknown_feature' : undefined)
+	);
+}
+
+function rateLimitedResponse(): Response {
+	return new Response('Rate limited', {
+		status: 429,
+		headers: { 'X-Denial-Reason': 'rate_limited' },
+	});
 }
 
 async function checkAuth(
@@ -313,8 +352,19 @@ async function checkAuth(
 			`license:${auth.licenseKey}`,
 			'json',
 		);
-		if (!value?.valid) {
-			return { allowed: false, reason: 'License not validated' };
+		if (!value) {
+			return {
+				allowed: false,
+				reason: 'License not validated',
+				denialCode: 'license_not_validated',
+			};
+		}
+		if (!value.valid) {
+			return {
+				allowed: false,
+				reason: 'License invalid',
+				denialCode: 'license_invalid',
+			};
 		}
 		return { allowed: true };
 	}
@@ -331,11 +381,10 @@ async function revalidateLicenseInBackground(
 	const throttleKey = `license-revalidated:${licenseKey}`;
 	const existing = await env.TRIAL_USAGE.get(throttleKey);
 	if (existing) return;
-	await env.TRIAL_USAGE.put(throttleKey, '1', { expirationTtl: 2 * 3600 });
 	try {
-		// In production, this calls the Polar API to check license status
-		// and updates the KV cache accordingly. The license key is the only
-		// data sent — no transcript content or device information.
+		// Calls the Polar API to check license status and updates the KV
+		// cache accordingly. The license key is the only data sent — no
+		// transcript content or device information.
 		const resp = await fetch(
 			'https://api.polar.sh/v1/customer-portal/license-keys/validate',
 			{
@@ -345,23 +394,33 @@ async function revalidateLicenseInBackground(
 			},
 		);
 		if (resp.ok) {
-			const result = await resp.json<{ status?: string; customer_id?: string }>();
+			const result = await resp.json<{
+				status?: string;
+				customer_id?: string;
+			}>();
 			const valid =
 				!!result.status &&
 				result.status !== 'revoked' &&
 				result.status !== 'disabled';
+			// Write throttle key only after successful Polar response —
+			// on network failure we want to retry on the next request, not wait 2 hours.
+			await env.TRIAL_USAGE.put(throttleKey, '1', {
+				expirationTtl: 2 * 3600,
+			});
 			if (valid) {
 				await env.TRIAL_USAGE.put(
 					`license:${licenseKey}`,
 					JSON.stringify({ valid: true, customerId: result.customer_id }),
-					{ expirationTtl: 10800 },
+					{ expirationTtl: 604800 },
 				);
 			} else {
 				await env.TRIAL_USAGE.delete(`license:${licenseKey}`);
 			}
 		}
-	} catch {
-		// Revalidation is best-effort — failures are silently ignored
+	} catch (err) {
+		console.error(
+			`[license] revalidation failed for ${licenseKey.slice(0, 8)}…: ${err instanceof Error ? err.message : 'unknown'}`,
+		);
 	}
 }
 
@@ -381,36 +440,31 @@ async function recordFreeUserTokens(
 	deviceId: string,
 	env: Env,
 ): Promise<void> {
-	// Match each count independently — handles any key ordering and nested
-	// objects (candidatesTokensDetail, etc.) that contain inner braces.
-	const PROMPT_RE = /"promptTokenCount"\s*:\s*(\d+)/;
-	const CANDIDATES_RE = /"candidatesTokenCount"\s*:\s*(\d+)/;
 	let promptTokens = 0;
 	let candidatesTokens = 0;
 	try {
 		const reader = stream.getReader();
 		const decoder = new TextDecoder();
-		// Keep tail of previous chunk to handle values split across boundaries.
 		let prev = '';
 		for (;;) {
 			const { done, value } = await reader.read();
 			if (done) break;
 			const chunk = decoder.decode(value, { stream: true });
 			const window = prev + chunk;
-			const pm = PROMPT_RE.exec(window);
-			const cm = CANDIDATES_RE.exec(window);
-			if (pm) promptTokens = parseInt(pm[1], 10);
-			if (cm) candidatesTokens = parseInt(cm[1], 10);
-			if (pm && cm) {
-				// Found both counts — drain remaining chunks without storing
-				for (;;) {
-					const { done: d } = await reader.read();
-					if (d) break;
-				}
+			// Use indexOf to skip regex on chunks without the target keys
+			if (promptTokens === 0 && window.includes('"promptTokenCount"')) {
+				const pm = PROMPT_TOKEN_RE.exec(window);
+				if (pm) promptTokens = parseInt(pm[1], 10);
+			}
+			if (candidatesTokens === 0 && window.includes('"candidatesTokenCount"')) {
+				const cm = CANDIDATES_TOKEN_RE.exec(window);
+				if (cm) candidatesTokens = parseInt(cm[1], 10);
+			}
+			if (promptTokens > 0 && candidatesTokens > 0) {
+				reader.cancel();
 				break;
 			}
-			// Keep last 64 chars for boundary overlap — individual key:value
-			// pairs are short, so a small overlap suffices.
+			// Keep last 64 chars for boundary overlap
 			prev = window.length > 64 ? window.slice(-64) : window;
 		}
 	} catch {
