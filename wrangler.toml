@@ -4,6 +4,7 @@ compatibility_date = "2024-12-01"
 
 # Secrets (set via `wrangler secret put`):
 #   GEMINI_API_KEY — Google Gemini API key
+#   POLAR_ORGANIZATION_ID — Polar organization ID for license validation
 
 [vars]
 # No plaintext secrets here

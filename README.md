@@ -33,11 +33,12 @@ MimicScribe App
 |  This Cloudflare Worker                  |
 |                                          |
 |  1. Parse auth from headers              |
-|  2. Rate limit (30 req/min)              |
-|  3. Check trial/license caps via DO/KV   |
-|  4. DELETE identity headers              |
-|  5. Forward request body to Google       |
-|  6. Return response to client            |
+|  2. Validate path against allowlist       |
+|  3. Rate limit (30/min + 60/min per IP)  |
+|  4. Check trial/license caps via DO/KV   |
+|  5. DELETE identity headers              |
+|  6. Forward request body to Google       |
+|  7. Return response to client            |
 |                                          |
 |  Request body is never read or logged.   |
 +------------------------------------------+

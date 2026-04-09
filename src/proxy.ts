@@ -24,6 +24,7 @@
 
 export interface Env {
 	GEMINI_API_KEY: string;
+	POLAR_ORGANIZATION_ID: string;
 	TRIAL_USAGE: KVNamespace;
 	TRIAL_COUNTER: DurableObjectNamespace;
 }
@@ -62,25 +63,27 @@ const PROMPT_TOKEN_RE = /"promptTokenCount"\s*:\s*(\d+)/;
 const CANDIDATES_TOKEN_RE = /"candidatesTokenCount"\s*:\s*(\d+)/;
 
 // ---------------------------------------------------------------------------
-// Rate limiting (in-memory, per-isolate)
+// Rate limiting (KV-backed, survives isolate restarts)
 // ---------------------------------------------------------------------------
 
-const rateLimiter = new Map<string, { count: number; resetAt: number }>();
+const MINUTE_TTL = 120; // 2× window for KV propagation safety
 
-export function checkRateLimit(key: string, maxPerMinute: number): boolean {
-	const now = Date.now();
-	const entry = rateLimiter.get(key);
-	if (!entry || now > entry.resetAt) {
-		if (!entry) {
-			for (const [k, v] of rateLimiter) {
-				if (now > v.resetAt) rateLimiter.delete(k);
-			}
-		}
-		rateLimiter.set(key, { count: 1, resetAt: now + 60_000 });
-		return true;
-	}
-	if (entry.count >= maxPerMinute) return false;
-	entry.count++;
+function currentMinuteKey(): string {
+	return new Date().toISOString().slice(0, 16); // YYYY-MM-DDTHH:MM
+}
+
+export async function checkMinuteRateLimit(
+	kv: KVNamespace,
+	key: string,
+	maxPerMinute: number,
+): Promise<boolean> {
+	const kvKey = `ratelimit:minute:${key}:${currentMinuteKey()}`;
+	const current = await kv.get(kvKey);
+	const count = current ? parseInt(current, 10) : 0;
+
+	if (count >= maxPerMinute) return false;
+
+	await kv.put(kvKey, String(count + 1), { expirationTtl: MINUTE_TTL });
 	return true;
 }
 
@@ -115,6 +118,32 @@ export function filteredResponseHeaders(headers: Headers): Headers {
 		if (value) out.set(name, value);
 	}
 	return out;
+}
+
+// ---------------------------------------------------------------------------
+// Path allowlist — only these Gemini API paths are proxied
+// ---------------------------------------------------------------------------
+
+const GEMINI_ALLOWLIST: Array<{ methods: Set<string>; re: RegExp }> = [
+	{
+		methods: new Set(['POST']),
+		re: /^\/v1beta\/models\/[a-zA-Z0-9._-]+:generateContent$/,
+	},
+	{
+		methods: new Set(['POST']),
+		re: /^\/v1beta\/cachedContents$/,
+	},
+	{
+		methods: new Set(['DELETE']),
+		re: /^\/v1beta\/cachedContents\/[a-zA-Z0-9._-]+$/,
+	},
+];
+
+function validateGeminiPath(method: string, pathname: string): boolean {
+	const googlePath = pathname.replace(/^\/api\/gemini/, '');
+	return GEMINI_ALLOWLIST.some(
+		(rule) => rule.methods.has(method) && rule.re.test(googlePath),
+	);
 }
 
 // ---------------------------------------------------------------------------
@@ -169,16 +198,12 @@ export async function handleGeminiProxy(
 	if (!auth) {
 		return new Response('Unauthorized', { status: 401 });
 	}
-	if (!checkRateLimit(`gemini:${auth.identity}`, 30)) {
-		console.log(
-			`[gemini] RATE_LIMITED model=${model} auth=${auth.type} id=${auth.shortId}`,
-		);
-		return rateLimitedResponse();
+	if (!validateGeminiPath(request.method, url.pathname)) {
+		return new Response('Forbidden', { status: 403 });
 	}
 
 	const feature = request.headers.get('X-Feature');
 	const meetingId = request.headers.get('X-Meeting-Id');
-	const localDate = request.headers.get('X-Local-Date');
 	const isCacheManagement = url.pathname.includes('/cachedContents');
 
 	// Fire off the upstream request immediately (auth check runs in parallel)
@@ -194,6 +219,13 @@ export async function handleGeminiProxy(
 		signal: controller.signal,
 	});
 
+	// Rate limit checks run in parallel with Gemini fetch — zero added latency on happy path
+	const ip = request.headers.get('CF-Connecting-IP') ?? 'unknown';
+	const rateLimitPromise = Promise.all([
+		checkMinuteRateLimit(env.TRIAL_USAGE, `gemini:${auth.identity}`, 30),
+		checkMinuteRateLimit(env.TRIAL_USAGE, `gemini-ip:${ip}`, 60),
+	]);
+
 	// Auth check (trial users → Durable Object, licensed users → KV)
 	const authStart = Date.now();
 
@@ -207,11 +239,10 @@ export async function handleGeminiProxy(
 		auth,
 		feature,
 		meetingId,
-		localDate,
+		request.headers.get('X-Local-Date'),
 		isCacheManagement,
 		env,
 	);
-	const authMs = Date.now() - authStart;
 
 	// Always trigger background revalidation for licensed users — even on denial.
 	// This self-heals when the KV entry expires (prevents permanent lockout).
@@ -219,6 +250,17 @@ export async function handleGeminiProxy(
 		ctx.waitUntil(revalidateLicenseInBackground(auth.licenseKey, env));
 	}
 
+	// Await parallel rate limit checks — abort if either limit exceeded
+	const [identityAllowed, ipAllowed] = await rateLimitPromise;
+	if (!identityAllowed || !ipAllowed) {
+		controller.abort();
+		console.log(
+			`[gemini] RATE_LIMITED model=${model} auth=${auth.type} id=${auth.shortId} identity=${!identityAllowed} ip=${!ipAllowed}`,
+		);
+		return rateLimitedResponse();
+	}
+
+	const authMs = Date.now() - authStart;
 	if (!authResult.allowed) {
 		controller.abort();
 		console.log(
@@ -390,7 +432,10 @@ async function revalidateLicenseInBackground(
 			{
 				method: 'POST',
 				headers: { 'Content-Type': 'application/json' },
-				body: JSON.stringify({ key: licenseKey }),
+				body: JSON.stringify({
+					key: licenseKey,
+					organization_id: env.POLAR_ORGANIZATION_ID,
+				}),
 			},
 		);
 		if (resp.ok) {
