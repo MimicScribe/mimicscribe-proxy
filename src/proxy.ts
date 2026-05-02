@@ -14,9 +14,11 @@
  *   - Send request content to any service other than Google's Gemini API
  *   - Associate transcript content with device identifiers or license keys
  *
- * Note: For trial users, the response stream is scanned chunk-by-chunk to
- * extract token counts for lifetime budget tracking. Each chunk is discarded
- * immediately — the full response is never buffered. See recordFreeUserTokens().
+ * Privacy ordering: all auth checks complete before the upstream `fetch()`
+ * is issued, so a denied request never reaches Google. The response stream
+ * is piped through a TransformStream that scans each chunk inline for the
+ * token count used in trial-budget tracking — chunks pass straight to the
+ * client and the body is never buffered or copied.
  *
  * The only data logged is structured metadata: model name, feature tag, auth
  * type, a truncated identity prefix (first 8 chars), and timing in milliseconds.
@@ -24,7 +26,6 @@
 
 export interface Env {
 	GEMINI_API_KEY: string;
-	POLAR_ORGANIZATION_ID: string;
 	TRIAL_USAGE: KVNamespace;
 	TRIAL_COUNTER: DurableObjectNamespace;
 }
@@ -168,6 +169,80 @@ export function buildGeminiUrl(request: Request, apiKey: string): string {
 }
 
 // ---------------------------------------------------------------------------
+// Token-counting transform
+// ---------------------------------------------------------------------------
+
+/**
+ * Create a TransformStream that passes chunks through to the client unchanged
+ * while scanning for `promptTokenCount` and `candidatesTokenCount` in the JSON.
+ *
+ * No tee, no buffering — each chunk is read once, scanned, and forwarded.
+ * The returned promise resolves with the total token count when the stream
+ * completes (or 0 if the counts aren't found / client disconnects early).
+ */
+function tokenCountingTransform(): {
+	transform: TransformStream;
+	tokens: Promise<number>;
+} {
+	let promptTokens = 0;
+	let candidatesTokens = 0;
+	let found = false;
+	const decoder = new TextDecoder();
+	let prev = '';
+
+	let resolveTokens: (n: number) => void;
+	const tokens = new Promise<number>((resolve) => {
+		resolveTokens = resolve;
+	});
+
+	const transform = new TransformStream({
+		transform(chunk, controller) {
+			controller.enqueue(chunk);
+			if (found) return;
+
+			const text = decoder.decode(chunk, { stream: true });
+			const window = prev + text;
+
+			if (promptTokens === 0 && window.includes('"promptTokenCount"')) {
+				const pm = PROMPT_TOKEN_RE.exec(window);
+				if (pm) promptTokens = parseInt(pm[1], 10);
+			}
+			if (candidatesTokens === 0 && window.includes('"candidatesTokenCount"')) {
+				const cm = CANDIDATES_TOKEN_RE.exec(window);
+				if (cm) candidatesTokens = parseInt(cm[1], 10);
+			}
+			if (promptTokens > 0 && candidatesTokens > 0) {
+				found = true;
+				resolveTokens(promptTokens + candidatesTokens);
+			}
+
+			prev = window.length > 64 ? window.slice(-64) : window;
+		},
+		flush() {
+			if (!found) resolveTokens(promptTokens + candidatesTokens);
+		},
+	});
+
+	return { transform, tokens };
+}
+
+async function recordFreeUserTokens(
+	tokens: number,
+	deviceId: string,
+	env: Env,
+): Promise<void> {
+	if (tokens === 0) return;
+	const stub = env.TRIAL_COUNTER.get(
+		env.TRIAL_COUNTER.idFromName(`trial:${deviceId}`),
+	);
+	await stub.fetch('https://do/', {
+		method: 'POST',
+		headers: { 'Content-Type': 'application/json' },
+		body: JSON.stringify({ type: 'recordTokens', tokens }),
+	});
+}
+
+// ---------------------------------------------------------------------------
 // Main proxy handler
 // ---------------------------------------------------------------------------
 
@@ -175,15 +250,16 @@ export function buildGeminiUrl(request: Request, apiKey: string): string {
  * Handle an incoming Gemini API request.
  *
  * Privacy-relevant behavior:
+ *   - All auth checks complete before the upstream `fetch()` is issued, so
+ *     the request body never leaves the Worker for a denied request.
  *   - `request.body` is forwarded directly to Google via `fetch()`. It is
  *     never read, buffered, or logged by this worker.
  *   - `console.log` only records metadata (model, feature, auth type,
  *     truncated ID prefix, timing). No content.
- *   - For trial users, the response stream is teed and scanned
- *     chunk-by-chunk for `usageMetadata`. Each chunk is discarded
- *     immediately after scanning — the full response is never buffered.
- *     Only the integer token count is retained.
- *     Licensed users are not affected (no tee, no scanning).
+ *   - The response stream is piped through a TransformStream that scans
+ *     each chunk inline for `usageMetadata`. Chunks pass through to the
+ *     client unchanged — the body is never buffered. Only the integer
+ *     token count is retained.
  */
 export async function handleGeminiProxy(
 	request: Request,
@@ -192,8 +268,7 @@ export async function handleGeminiProxy(
 ): Promise<Response> {
 	const reqStart = Date.now();
 	const url = new URL(request.url);
-	const model =
-		url.pathname.split('/models/')[1]?.split(':')[0] ?? 'unknown';
+	const model = url.pathname.split('/models/')[1]?.split(':')[0] ?? 'unknown';
 	const auth = parseAuth(request);
 	if (!auth) {
 		return new Response('Unauthorized', { status: 401 });
@@ -204,65 +279,34 @@ export async function handleGeminiProxy(
 
 	const feature = request.headers.get('X-Feature');
 	const meetingId = request.headers.get('X-Meeting-Id');
+	const localDate = request.headers.get('X-Local-Date');
 	const isCacheManagement = url.pathname.includes('/cachedContents');
-
-	// Fire off the upstream request immediately (auth check runs in parallel)
-	const controller = new AbortController();
-	const geminiStart = Date.now();
-	const geminiPromise = fetch(buildGeminiUrl(request, env.GEMINI_API_KEY), {
-		method: request.method,
-		headers: strippedHeaders(request.headers),
-		body:
-			request.method !== 'GET' && request.method !== 'HEAD'
-				? request.body
-				: undefined,
-		signal: controller.signal,
-	});
-
-	// Rate limit checks run in parallel with Gemini fetch — zero added latency on happy path
-	const ip = request.headers.get('CF-Connecting-IP') ?? 'unknown';
-	const rateLimitPromise = Promise.all([
-		checkMinuteRateLimit(env.TRIAL_USAGE, `gemini:${auth.identity}`, 30),
-		checkMinuteRateLimit(env.TRIAL_USAGE, `gemini-ip:${ip}`, 60),
-	]);
-
-	// Auth check (trial users → Durable Object, licensed users → KV)
-	const authStart = Date.now();
 
 	// Trial users must provide X-Feature for non-cache requests
 	if (auth.deviceId && !isCacheManagement && !feature) {
-		controller.abort();
 		return new Response('Missing X-Feature header', { status: 400 });
 	}
 
-	const authResult = await checkAuth(
-		auth,
-		feature,
-		meetingId,
-		request.headers.get('X-Local-Date'),
-		isCacheManagement,
-		env,
-	);
+	// Run rate-limit + auth checks in parallel. The Gemini fetch is held
+	// until they all pass — the privacy guarantee is that the request body
+	// never leaves the Worker for a denied request.
+	const ip = request.headers.get('CF-Connecting-IP') ?? 'unknown';
+	const authStart = Date.now();
+	const [identityAllowed, ipAllowed, authResult] = await Promise.all([
+		checkMinuteRateLimit(env.TRIAL_USAGE, `gemini:${auth.identity}`, 30),
+		checkMinuteRateLimit(env.TRIAL_USAGE, `gemini-ip:${ip}`, 60),
+		checkAuth(auth, feature, meetingId, localDate, isCacheManagement, env),
+	]);
+	const authMs = Date.now() - authStart;
 
-	// Always trigger background revalidation for licensed users — even on denial.
-	// This self-heals when the KV entry expires (prevents permanent lockout).
-	if (auth.licenseKey) {
-		ctx.waitUntil(revalidateLicenseInBackground(auth.licenseKey, env));
-	}
-
-	// Await parallel rate limit checks — abort if either limit exceeded
-	const [identityAllowed, ipAllowed] = await rateLimitPromise;
 	if (!identityAllowed || !ipAllowed) {
-		controller.abort();
 		console.log(
 			`[gemini] RATE_LIMITED model=${model} auth=${auth.type} id=${auth.shortId} identity=${!identityAllowed} ip=${!ipAllowed}`,
 		);
 		return rateLimitedResponse();
 	}
 
-	const authMs = Date.now() - authStart;
 	if (!authResult.allowed) {
-		controller.abort();
 		console.log(
 			`[gemini] AUTH_DENIED model=${model} feature=${feature} auth=${auth.type} id=${auth.shortId} authMs=${authMs} reason=${authResult.reason}`,
 		);
@@ -277,9 +321,18 @@ export async function handleGeminiProxy(
 		});
 	}
 
+	// All checks passed — only now does the request body leave the Worker.
+	const geminiStart = Date.now();
 	let geminiResponse: Response;
 	try {
-		geminiResponse = await geminiPromise;
+		geminiResponse = await fetch(buildGeminiUrl(request, env.GEMINI_API_KEY), {
+			method: request.method,
+			headers: strippedHeaders(request.headers),
+			body:
+				request.method !== 'GET' && request.method !== 'HEAD'
+					? request.body
+					: undefined,
+		});
 	} catch (err) {
 		const geminiMs = Date.now() - geminiStart;
 		const totalMs = Date.now() - reqStart;
@@ -302,12 +355,16 @@ export async function handleGeminiProxy(
 		`[gemini] OK model=${model} feature=${feature} auth=${auth.type} id=${auth.shortId} authMs=${authMs} geminiMs=${geminiMs} totalMs=${totalMs} status=${geminiResponse.status}`,
 	);
 
-	// For trial users: tee the stream to count tokens for lifetime budget
-	// tracking. Only the integer token count is recorded — text is discarded.
+	// For trial users: pipe the response through a TransformStream that scans
+	// for the token count inline. Chunks pass straight to the client; only
+	// the integer count is retained for lifetime budget tracking.
 	if (auth.deviceId && geminiResponse.body) {
-		const [clientStream, countingStream] = geminiResponse.body.tee();
-		ctx.waitUntil(recordFreeUserTokens(countingStream, auth.deviceId, env));
-		return new Response(clientStream, {
+		const { transform, tokens } = tokenCountingTransform();
+		const readable = geminiResponse.body.pipeThrough(transform);
+		ctx.waitUntil(
+			tokens.then((t) => recordFreeUserTokens(t, auth.deviceId!, env)),
+		);
+		return new Response(readable, {
 			status: geminiResponse.status,
 			headers: responseHeaders,
 		});
@@ -335,7 +392,7 @@ interface AuthResult {
 const DENIAL_CODES: Record<string, string> = {
 	'Lifetime free tier budget exhausted': 'lifetime_exhausted',
 	'Daily cap reached': 'daily_cap',
-	'Feature requires Pro': 'pro_required',
+	'Feature requires Unlimited plan': 'pro_required',
 };
 
 function denialCodeFor(reason: string | undefined): string | undefined {
@@ -389,7 +446,11 @@ async function checkAuth(
 		});
 		return resp.json();
 	} else {
-		// Licensed users: validate against KV cache
+		// Licensed users: validate against the KV cache. The cache is populated
+		// by a separate `/api/validate-license` endpoint in the production
+		// website which calls the billing provider directly — that path is not
+		// part of this proxy, so no third-party traffic ever originates from a
+		// request that proxies transcript content.
 		const value = await env.TRIAL_USAGE.get<{ valid: boolean }>(
 			`license:${auth.licenseKey}`,
 			'json',
@@ -410,120 +471,4 @@ async function checkAuth(
 		}
 		return { allowed: true };
 	}
-}
-
-/**
- * Periodically re-validate a license key against the upstream provider
- * (Polar) so that the KV cache stays fresh. Throttled to once per 2 hours.
- */
-async function revalidateLicenseInBackground(
-	licenseKey: string,
-	env: Env,
-): Promise<void> {
-	const throttleKey = `license-revalidated:${licenseKey}`;
-	const existing = await env.TRIAL_USAGE.get(throttleKey);
-	if (existing) return;
-	try {
-		// Calls the Polar API to check license status and updates the KV
-		// cache accordingly. The license key is the only data sent — no
-		// transcript content or device information.
-		const resp = await fetch(
-			'https://api.polar.sh/v1/customer-portal/license-keys/validate',
-			{
-				method: 'POST',
-				headers: { 'Content-Type': 'application/json' },
-				body: JSON.stringify({
-					key: licenseKey,
-					organization_id: env.POLAR_ORGANIZATION_ID,
-				}),
-			},
-		);
-		if (resp.ok) {
-			const result = await resp.json<{
-				status?: string;
-				customer_id?: string;
-			}>();
-			const valid =
-				!!result.status &&
-				result.status !== 'revoked' &&
-				result.status !== 'disabled';
-			// Write throttle key only after successful Polar response —
-			// on network failure we want to retry on the next request, not wait 2 hours.
-			await env.TRIAL_USAGE.put(throttleKey, '1', {
-				expirationTtl: 2 * 3600,
-			});
-			if (valid) {
-				await env.TRIAL_USAGE.put(
-					`license:${licenseKey}`,
-					JSON.stringify({ valid: true, customerId: result.customer_id }),
-					{ expirationTtl: 604800 },
-				);
-			} else {
-				await env.TRIAL_USAGE.delete(`license:${licenseKey}`);
-			}
-		}
-	} catch (err) {
-		console.error(
-			`[license] revalidation failed for ${licenseKey.slice(0, 8)}…: ${err instanceof Error ? err.message : 'unknown'}`,
-		);
-	}
-}
-
-// ---------------------------------------------------------------------------
-// Token counting for trial budget tracking
-// ---------------------------------------------------------------------------
-
-/**
- * Scan a Gemini response stream chunk-by-chunk to extract the token count
- * from usageMetadata, then record it to the DO for lifetime tracking.
- *
- * Each chunk is discarded immediately after scanning — only the integer
- * token counts are retained. The full response is never buffered in memory.
- */
-async function recordFreeUserTokens(
-	stream: ReadableStream,
-	deviceId: string,
-	env: Env,
-): Promise<void> {
-	let promptTokens = 0;
-	let candidatesTokens = 0;
-	try {
-		const reader = stream.getReader();
-		const decoder = new TextDecoder();
-		let prev = '';
-		for (;;) {
-			const { done, value } = await reader.read();
-			if (done) break;
-			const chunk = decoder.decode(value, { stream: true });
-			const window = prev + chunk;
-			// Use indexOf to skip regex on chunks without the target keys
-			if (promptTokens === 0 && window.includes('"promptTokenCount"')) {
-				const pm = PROMPT_TOKEN_RE.exec(window);
-				if (pm) promptTokens = parseInt(pm[1], 10);
-			}
-			if (candidatesTokens === 0 && window.includes('"candidatesTokenCount"')) {
-				const cm = CANDIDATES_TOKEN_RE.exec(window);
-				if (cm) candidatesTokens = parseInt(cm[1], 10);
-			}
-			if (promptTokens > 0 && candidatesTokens > 0) {
-				reader.cancel();
-				break;
-			}
-			// Keep last 64 chars for boundary overlap
-			prev = window.length > 64 ? window.slice(-64) : window;
-		}
-	} catch {
-		return;
-	}
-	const tokens = promptTokens + candidatesTokens;
-	if (tokens === 0) return;
-
-	const stub = env.TRIAL_COUNTER.get(
-		env.TRIAL_COUNTER.idFromName(`trial:${deviceId}`),
-	);
-	await stub.fetch('https://do/', {
-		method: 'POST',
-		headers: { 'Content-Type': 'application/json' },
-		body: JSON.stringify({ type: 'recordTokens', tokens }),
-	});
 }
