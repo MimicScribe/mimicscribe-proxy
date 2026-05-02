@@ -40,6 +40,8 @@ MimicScribe App
 |  6. Forward request body to Google       |
 |  7. Return response to client            |
 |                                          |
+|  Steps 1–4 complete before step 6 — a    |
+|  denied request never reaches Google.    |
 |  Request body is never read or logged.   |
 +------------------------------------------+
     |
@@ -53,9 +55,9 @@ Google Gemini API
 
 ## Trial token counting
 
-For free-tier users, the proxy tees the Gemini response stream and scans it chunk-by-chunk for the `usageMetadata` field. Each chunk is discarded immediately after scanning — the full response is never buffered in memory. When `usageMetadata` is found, only the integer token count (`promptTokenCount` + `candidatesTokenCount`) is extracted and recorded to a Durable Object for lifetime budget tracking.
+For free-tier users, the Gemini response body is piped through a `TransformStream` that scans each chunk inline as it passes through to the client. The chunks are forwarded unchanged — the response body is never buffered, never copied, never inspected for content. When `usageMetadata` is found, only the integer token count (`promptTokenCount` + `candidatesTokenCount`) is extracted and recorded to a Durable Object for lifetime budget tracking.
 
-Licensed users are not affected — their responses are streamed directly to the client with no tee or scanning.
+Licensed users in this open-source extract are not scanned. Production additionally tracks a monthly token budget for licensed users, which adds the same inline-scan logic to the licensed-user response path; the privacy guarantee is the same — chunks pass through unchanged and only the integer count is retained.
 
 ## Durable Object state
 
@@ -65,7 +67,9 @@ For trial users, the `checkAndIncrement` call to the Durable Object includes the
 
 This repository contains the Gemini proxy logic extracted from our production SvelteKit deployment. The production version is integrated into our website's Cloudflare Workers setup. The core proxy behavior — header stripping, request body forwarding, response handling, and logging — is identical to what you see here.
 
-The production Worker also serves separate endpoints for usage reporting (Polar), analytics, and crash diagnostics. These endpoints are not part of the Gemini proxy path and are not included in this repository.
+The production Worker also serves separate endpoints for license validation (Stripe), checkout, analytics, and crash diagnostics. These endpoints are not part of the Gemini proxy path and are not included in this repository. License validation specifically runs from a dedicated `/api/validate-license` endpoint triggered by the client — not from the proxy path itself, so no third-party traffic ever originates from a request that proxies transcript content.
+
+Production additionally tracks a monthly token budget for licensed users (this extract does not). The privacy property is the same as for the trial path — chunks pass through unchanged and only the integer token count is retained.
 
 ## License
 
