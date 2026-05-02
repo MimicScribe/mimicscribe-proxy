@@ -14,11 +14,9 @@
  *   - Send request content to any service other than Google's Gemini API
  *   - Associate transcript content with device identifiers or license keys
  *
- * Privacy ordering: all auth checks complete before the upstream `fetch()`
- * is issued, so a denied request never reaches Google. The response stream
- * is piped through a TransformStream that scans each chunk inline for the
- * token count used in trial-budget tracking — chunks pass straight to the
- * client and the body is never buffered or copied.
+ * The response stream is piped through a TransformStream that scans each
+ * chunk inline for the token count used in trial-budget tracking — chunks
+ * pass straight to the client and the body is never buffered or copied.
  *
  * The only data logged is structured metadata: model name, feature tag, auth
  * type, a truncated identity prefix (first 8 chars), and timing in milliseconds.
@@ -250,8 +248,6 @@ async function recordFreeUserTokens(
  * Handle an incoming Gemini API request.
  *
  * Privacy-relevant behavior:
- *   - All auth checks complete before the upstream `fetch()` is issued, so
- *     the request body never leaves the Worker for a denied request.
  *   - `request.body` is forwarded directly to Google via `fetch()`. It is
  *     never read, buffered, or logged by this worker.
  *   - `console.log` only records metadata (model, feature, auth type,
@@ -260,6 +256,9 @@ async function recordFreeUserTokens(
  *     each chunk inline for `usageMetadata`. Chunks pass through to the
  *     client unchanged — the body is never buffered. Only the integer
  *     token count is retained.
+ *   - The upstream fetch runs in parallel with auth/rate-limit checks for
+ *     latency. Deny paths call `controller.abort()` to cancel the in-flight
+ *     request.
  */
 export async function handleGeminiProxy(
 	request: Request,
@@ -287,9 +286,21 @@ export async function handleGeminiProxy(
 		return new Response('Missing X-Feature header', { status: 400 });
 	}
 
-	// Run rate-limit + auth checks in parallel. The Gemini fetch is held
-	// until they all pass — the privacy guarantee is that the request body
-	// never leaves the Worker for a denied request.
+	// Fire upstream fetch immediately, in parallel with auth-side checks. The
+	// proxy itself never reads, buffers, or logs the body — that's the privacy
+	// guarantee. Deny paths abort the in-flight request via AbortController.
+	const controller = new AbortController();
+	const geminiStart = Date.now();
+	const geminiPromise = fetch(buildGeminiUrl(request, env.GEMINI_API_KEY), {
+		method: request.method,
+		headers: strippedHeaders(request.headers),
+		body:
+			request.method !== 'GET' && request.method !== 'HEAD'
+				? request.body
+				: undefined,
+		signal: controller.signal,
+	});
+
 	const ip = request.headers.get('CF-Connecting-IP') ?? 'unknown';
 	const authStart = Date.now();
 	const [identityAllowed, ipAllowed, authResult] = await Promise.all([
@@ -300,6 +311,7 @@ export async function handleGeminiProxy(
 	const authMs = Date.now() - authStart;
 
 	if (!identityAllowed || !ipAllowed) {
+		controller.abort();
 		console.log(
 			`[gemini] RATE_LIMITED model=${model} auth=${auth.type} id=${auth.shortId} identity=${!identityAllowed} ip=${!ipAllowed}`,
 		);
@@ -307,6 +319,7 @@ export async function handleGeminiProxy(
 	}
 
 	if (!authResult.allowed) {
+		controller.abort();
 		console.log(
 			`[gemini] AUTH_DENIED model=${model} feature=${feature} auth=${auth.type} id=${auth.shortId} authMs=${authMs} reason=${authResult.reason}`,
 		);
@@ -321,18 +334,9 @@ export async function handleGeminiProxy(
 		});
 	}
 
-	// All checks passed — only now does the request body leave the Worker.
-	const geminiStart = Date.now();
 	let geminiResponse: Response;
 	try {
-		geminiResponse = await fetch(buildGeminiUrl(request, env.GEMINI_API_KEY), {
-			method: request.method,
-			headers: strippedHeaders(request.headers),
-			body:
-				request.method !== 'GET' && request.method !== 'HEAD'
-					? request.body
-					: undefined,
-		});
+		geminiResponse = await geminiPromise;
 	} catch (err) {
 		const geminiMs = Date.now() - geminiStart;
 		const totalMs = Date.now() - reqStart;
