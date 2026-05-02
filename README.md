@@ -40,8 +40,6 @@ MimicScribe App
 |  6. Forward request body to Google       |
 |  7. Return response to client            |
 |                                          |
-|  Steps 1–4 complete before step 6 — a    |
-|  denied request never reaches Google.    |
 |  Request body is never read or logged.   |
 +------------------------------------------+
     |
