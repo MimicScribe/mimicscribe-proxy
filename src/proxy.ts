@@ -120,6 +120,14 @@ export function filteredResponseHeaders(headers: Headers): Headers {
 }
 
 // ---------------------------------------------------------------------------
+// Model allowlist — only the models the app actually uses are proxied.
+// Prevents proxying to expensive/future models. Keep in sync with the
+// `GeminiModel` cases in the app (GeminiClient.swift).
+// ---------------------------------------------------------------------------
+
+const ALLOWED_MODELS = new Set(['gemini-3.1-flash-lite']);
+
+// ---------------------------------------------------------------------------
 // Path allowlist — only these Gemini API paths are proxied
 // ---------------------------------------------------------------------------
 
@@ -276,6 +284,16 @@ export async function handleGeminiProxy(
 		return new Response('Forbidden', { status: 403 });
 	}
 
+	// Enforce the model allowlist — only the models the app actually uses.
+	// Cache-management paths (/cachedContents) carry no model, so `model` is
+	// 'unknown'; skip the check for them and let the path allowlist govern.
+	if (model !== 'unknown' && !ALLOWED_MODELS.has(model)) {
+		console.log(
+			`[gemini] MODEL_BLOCKED model=${model} auth=${auth.type} id=${auth.shortId}`,
+		);
+		return new Response('Model not allowed', { status: 403 });
+	}
+
 	const feature = request.headers.get('X-Feature');
 	const meetingId = request.headers.get('X-Meeting-Id');
 	const localDate = request.headers.get('X-Local-Date');
@@ -359,6 +377,21 @@ export async function handleGeminiProxy(
 		`[gemini] OK model=${model} feature=${feature} auth=${auth.type} id=${auth.shortId} authMs=${authMs} geminiMs=${geminiMs} totalMs=${totalMs} status=${geminiResponse.status}`,
 	);
 
+	// Light licensed users: tally the meeting against the per-cycle cap, but only
+	// on a successful upstream response — a failed call didn't produce a meeting.
+	if (
+		auth.licenseKey &&
+		geminiResponse.ok &&
+		authResult.licensePlan === 'light' &&
+		authResult.meetingCycleId &&
+		feature &&
+		LIGHT_MEETING_FEATURES.has(feature)
+	) {
+		ctx.waitUntil(
+			recordLicenseMeeting(env, auth.licenseKey, authResult.meetingCycleId),
+		);
+	}
+
 	// For trial users: pipe the response through a TransformStream that scans
 	// for the token count inline. Chunks pass straight to the client; only
 	// the integer count is retained for lifetime budget tracking.
@@ -389,6 +422,74 @@ interface AuthResult {
 	reason?: string;
 	denialCode?: string;
 	lifetimeWarning?: string;
+	// Light-plan meeting-cycle context, returned by checkAuth so the proxy can
+	// increment the counter on a successful meeting call (only set for Light).
+	licensePlan?: 'light' | 'unlimited';
+	meetingCycleId?: string;
+}
+
+// ---------------------------------------------------------------------------
+// Light plan: meeting count per billing cycle
+// ---------------------------------------------------------------------------
+//
+// The Light tier is volume-capped, not feature-gated. Its product-facing limit
+// is meetings per billing cycle; file imports share the pool (an imported file
+// IS an AI meeting), so both features draw down the same counter. The license
+// record in KV (written by the website's Stripe webhook, not this proxy) carries
+// the resolved `plan` and the subscription period bounds — this proxy only reads
+// them. Unlimited licenses skip all of this.
+
+/** Must match the client's `BillingConstants.lightMeetingMonthlyCap`. */
+const LIGHT_MEETING_CYCLE_CAP = 30;
+
+/** Features that draw down the shared Light meeting allowance. */
+const LIGHT_MEETING_FEATURES = new Set(['meeting', 'fileImport']);
+
+/** Shape of the `license:<key>` KV record this proxy reads (subset). */
+interface LicenseValue {
+	valid: boolean;
+	plan?: 'light' | 'unlimited';
+	currentPeriodStart?: number;
+	currentPeriodEnd?: number;
+}
+
+function currentMonthKey(): string {
+	return new Date().toISOString().slice(0, 7); // YYYY-MM
+}
+
+/**
+ * Cycle id for the meeting counter. Prefer the subscription anniversary
+ * (`currentPeriodStart`) so the count resets with the billing cycle; fall back
+ * to the calendar month when the period isn't stored (older KV records).
+ */
+function meetingCycleId(value: LicenseValue): string {
+	if (value.currentPeriodStart && Number.isFinite(value.currentPeriodStart)) {
+		return `ps${value.currentPeriodStart}`;
+	}
+	return currentMonthKey();
+}
+
+async function getLicenseMeetingCount(
+	kv: KVNamespace,
+	licenseKey: string,
+	cycleId: string,
+): Promise<number> {
+	const raw = await kv.get(`license-meetings:${licenseKey}:${cycleId}`);
+	return raw ? parseInt(raw, 10) : 0;
+}
+
+async function recordLicenseMeeting(
+	env: Env,
+	licenseKey: string,
+	cycleId: string,
+): Promise<void> {
+	const k = `license-meetings:${licenseKey}:${cycleId}`;
+	const current = await env.TRIAL_USAGE.get(k);
+	const used = current ? parseInt(current, 10) : 0;
+	await env.TRIAL_USAGE.put(k, String(used + 1), {
+		// ~2 cycles of headroom so a mid-cycle gap can't expire the live count.
+		expirationTtl: 70 * 24 * 3600,
+	});
 }
 
 /** Map DO denial reasons to machine-readable codes for X-Denial-Reason header.
@@ -455,7 +556,7 @@ async function checkAuth(
 		// website which calls the billing provider directly — that path is not
 		// part of this proxy, so no third-party traffic ever originates from a
 		// request that proxies transcript content.
-		const value = await env.TRIAL_USAGE.get<{ valid: boolean }>(
+		const value = await env.TRIAL_USAGE.get<LicenseValue>(
 			`license:${auth.licenseKey}`,
 			'json',
 		);
@@ -473,6 +574,30 @@ async function checkAuth(
 				denialCode: 'license_invalid',
 			};
 		}
-		return { allowed: true };
+
+		// Light plan: enforce the per-cycle meeting cap over the shared
+		// {meeting, fileImport} pool. Unlimited skips this entirely.
+		const plan = value.plan ?? 'unlimited';
+		if (plan !== 'light') return { allowed: true };
+
+		const cycleId = meetingCycleId(value);
+		if (feature && LIGHT_MEETING_FEATURES.has(feature)) {
+			const used = await getLicenseMeetingCount(
+				env.TRIAL_USAGE,
+				auth.licenseKey!,
+				cycleId,
+			);
+			if (used >= LIGHT_MEETING_CYCLE_CAP) {
+				return {
+					allowed: false,
+					reason: 'Monthly meeting limit reached',
+					denialCode: 'monthly_cap_reached',
+					licensePlan: 'light',
+					meetingCycleId: cycleId,
+				};
+			}
+		}
+		// Allowed — hand back the cycle context so the proxy can increment on success.
+		return { allowed: true, licensePlan: 'light', meetingCycleId: cycleId };
 	}
 }
