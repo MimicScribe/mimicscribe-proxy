@@ -120,6 +120,14 @@ export function filteredResponseHeaders(headers: Headers): Headers {
 }
 
 // ---------------------------------------------------------------------------
+// Model allowlist — only the models the app actually uses are proxied.
+// Prevents proxying to expensive/future models. Keep in sync with the
+// `GeminiModel` cases in the app (GeminiClient.swift).
+// ---------------------------------------------------------------------------
+
+const ALLOWED_MODELS = new Set(['gemini-3.1-flash-lite']);
+
+// ---------------------------------------------------------------------------
 // Path allowlist — only these Gemini API paths are proxied
 // ---------------------------------------------------------------------------
 
@@ -274,6 +282,16 @@ export async function handleGeminiProxy(
 	}
 	if (!validateGeminiPath(request.method, url.pathname)) {
 		return new Response('Forbidden', { status: 403 });
+	}
+
+	// Enforce the model allowlist — only the models the app actually uses.
+	// Cache-management paths (/cachedContents) carry no model, so `model` is
+	// 'unknown'; skip the check for them and let the path allowlist govern.
+	if (model !== 'unknown' && !ALLOWED_MODELS.has(model)) {
+		console.log(
+			`[gemini] MODEL_BLOCKED model=${model} auth=${auth.type} id=${auth.shortId}`,
+		);
+		return new Response('Model not allowed', { status: 403 });
 	}
 
 	const feature = request.headers.get('X-Feature');
