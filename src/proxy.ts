@@ -440,7 +440,7 @@ interface AuthResult {
 // them. Unlimited licenses skip all of this.
 
 /** Must match the client's `BillingConstants.lightMeetingMonthlyCap`. */
-const LIGHT_MEETING_CYCLE_CAP = 30;
+const LIGHT_MEETING_CYCLE_CAP = 200;
 
 /** Features that draw down the shared Light meeting allowance. */
 const LIGHT_MEETING_FEATURES = new Set(['meeting', 'fileImport']);
