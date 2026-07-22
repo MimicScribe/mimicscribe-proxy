@@ -125,7 +125,7 @@ export function filteredResponseHeaders(headers: Headers): Headers {
 // `GeminiModel` cases in the app (GeminiClient.swift).
 // ---------------------------------------------------------------------------
 
-const ALLOWED_MODELS = new Set(['gemini-3.1-flash-lite']);
+const ALLOWED_MODELS = new Set(['gemini-3.1-flash-lite', 'gemini-3.5-flash-lite']);
 
 // ---------------------------------------------------------------------------
 // Path allowlist — only these Gemini API paths are proxied
@@ -440,7 +440,7 @@ interface AuthResult {
 // them. Unlimited licenses skip all of this.
 
 /** Must match the client's `BillingConstants.lightMeetingMonthlyCap`. */
-const LIGHT_MEETING_CYCLE_CAP = 30;
+const LIGHT_MEETING_CYCLE_CAP = 200;
 
 /** Features that draw down the shared Light meeting allowance. */
 const LIGHT_MEETING_FEATURES = new Set(['meeting', 'fileImport']);
