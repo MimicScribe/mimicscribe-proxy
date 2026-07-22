@@ -125,7 +125,7 @@ export function filteredResponseHeaders(headers: Headers): Headers {
 // `GeminiModel` cases in the app (GeminiClient.swift).
 // ---------------------------------------------------------------------------
 
-const ALLOWED_MODELS = new Set(['gemini-3.1-flash-lite']);
+const ALLOWED_MODELS = new Set(['gemini-3.1-flash-lite', 'gemini-3.5-flash-lite']);
 
 // ---------------------------------------------------------------------------
 // Path allowlist — only these Gemini API paths are proxied
