@@ -100,6 +100,7 @@ export function strippedHeaders(headers: Headers): Headers {
 	out.delete('X-License-Key');
 	out.delete('X-Feature');
 	out.delete('X-Meeting-Id');
+	out.delete('X-Action-Id');
 	out.delete('X-Local-Date');
 	out.delete('Host');
 	return out;
@@ -296,6 +297,9 @@ export async function handleGeminiProxy(
 
 	const feature = request.headers.get('X-Feature');
 	const meetingId = request.headers.get('X-Meeting-Id');
+	// One random id per user action (a retry after a transient failure, or a
+	// primary + hedge pair, shares it) so the counter charges an action once.
+	const actionId = request.headers.get('X-Action-Id');
 	const localDate = request.headers.get('X-Local-Date');
 	const isCacheManagement = url.pathname.includes('/cachedContents');
 
@@ -324,7 +328,7 @@ export async function handleGeminiProxy(
 	const [identityAllowed, ipAllowed, authResult] = await Promise.all([
 		checkMinuteRateLimit(env.TRIAL_USAGE, `gemini:${auth.identity}`, 30),
 		checkMinuteRateLimit(env.TRIAL_USAGE, `gemini-ip:${ip}`, 60),
-		checkAuth(auth, feature, meetingId, localDate, isCacheManagement, env),
+		checkAuth(auth, feature, meetingId, actionId, localDate, isCacheManagement, env),
 	]);
 	const authMs = Date.now() - authStart;
 
@@ -519,6 +523,7 @@ async function checkAuth(
 	auth: AuthContext,
 	feature: string | null,
 	meetingId: string | null,
+	actionId: string | null,
 	localDate: string | null,
 	isCacheManagement: boolean,
 	env: Env,
@@ -528,8 +533,9 @@ async function checkAuth(
 		// and lifetime token budgets. Cache management requests only check
 		// the lifetime budget (no feature increment).
 		//
-		// The DO call includes deviceId and meetingId so the DO can enforce
-		// per-meeting caps (e.g., one summary per meeting). These values are
+		// The DO call includes deviceId, meetingId and actionId so the DO can
+		// enforce per-meeting caps (e.g., one summary per meeting) and count a
+		// retried action once. These values are
 		// stored in the DO's transient state for cap tracking only — they are
 		// not logged or sent to any external service.
 		const stub = env.TRIAL_COUNTER.get(
@@ -541,6 +547,7 @@ async function checkAuth(
 					type: 'checkAndIncrement',
 					feature,
 					meetingId: meetingId ?? undefined,
+					actionId: actionId ?? undefined,
 					deviceId: auth.deviceId,
 					localDate: localDate ?? undefined,
 				};

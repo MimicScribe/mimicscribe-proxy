@@ -59,7 +59,7 @@ Licensed users in this open-source extract are not scanned. Production additiona
 
 ## Durable Object state
 
-For trial users, the `checkAndIncrement` call to the Durable Object includes the `deviceId` and `meetingId` (if present). The DO uses these to enforce per-meeting caps (e.g., one summary per meeting per device). These identifiers are stored in the DO's transient state for cap tracking only — they are not logged or sent to any external service. The DO does not receive or store any transcript content.
+For trial users, the `checkAndIncrement` call to the Durable Object includes the `deviceId`, `meetingId` (if present) and `actionId` (if present — a random per-action id the client mints so a retry after a transient failure is counted once). The DO uses these to enforce per-meeting caps (e.g., one summary per meeting per device) and to de-duplicate retries. These identifiers are stored in the DO's transient state for cap tracking only — they are not logged or sent to any external service. The DO does not receive or store any transcript content.
 
 ## Production differences
 
